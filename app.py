@@ -4,9 +4,41 @@ import sqlite3
 import os
 import jwt
 import datetime
+import xml.etree.ElementTree as ET
+from xml.sax import make_parser, ContentHandler
+from xml.sax.handler import feature_external_ges
+import io
+import threading
+from contextlib import contextmanager
+from functools import wraps
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Database connection pool using thread-local storage
+_local = threading.local()
+
+@contextmanager
+def get_db_connection():
+    """Context manager for database connections with proper cleanup"""
+    if not hasattr(_local, 'conn') or _local.conn is None:
+        _local.conn = sqlite3.connect('pwnterrey.db', check_same_thread=False)
+        _local.conn.row_factory = sqlite3.Row  # Enable dict-like access
+    
+    try:
+        yield _local.conn
+    except Exception:
+        _local.conn.rollback()
+        raise
+    else:
+        _local.conn.commit()
+
+@app.teardown_appcontext
+def close_db_connection(error):
+    """Close database connection at request end"""
+    if hasattr(_local, 'conn') and _local.conn:
+        _local.conn.close()
+        _local.conn = None
 
 @app.after_request
 def after_request(response):
@@ -14,33 +46,104 @@ def after_request(response):
     return response
 
 def init_db():
-    conn = sqlite3.connect('pwnterrey.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            first_name TEXT,
-            last_name TEXT,
-            email TEXT,
-            phone TEXT,
-            picture TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    """Initialize database with proper error handling"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    first_name TEXT DEFAULT '',
+                    last_name TEXT DEFAULT '',
+                    email TEXT DEFAULT '',
+                    phone TEXT DEFAULT '',
+                    picture TEXT DEFAULT ''
+                )
+            ''')
+            
+            # Create index for better performance
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_profiles_username 
+                ON profiles(username)
+            ''')
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+        raise
 
+# Initialize database on startup
 init_db()
 
-# Very weak secret key (vulnerable)
-SECRET_KEY = "Aa!123456"  # Replace this with a secure one in real apps or .env files please
+# Configuration constants
+SECRET_KEY = "Aa!123456"  # Intentionally weak - vulnerability preserved
+XML_SECRET = "#Pwnt3rr3yS3cureK3y!"
 
-users = {
-    "admin": {"password": "admin", "is_admin": True},
-    "user": {"password": "user", "is_admin": False}
-}   
+# User database - moved to class for better organization
+class UserManager:
+    def __init__(self):
+        self.users = {
+            "admin": {"password": "admin", "is_admin": True},
+            "user": {"password": "user", "is_admin": False}
+        }
+    
+    def authenticate(self, username, password):
+        """Authenticate user credentials"""
+        user = self.users.get(username)
+        return user and user["password"] == password
+    
+    def get_user_info(self, username):
+        """Get user information"""
+        return self.users.get(username)
 
-HTML_TEMPLATE = '''
+user_manager = UserManager()
+
+def require_auth(f):
+    """Decorator for routes requiring authentication"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Missing or invalid token'}), 403
+        
+        try:
+            token = auth_header.split()[1]
+            # Try both secret keys for token validation
+            data = None
+            for secret in [SECRET_KEY, XML_SECRET]:
+                try:
+                    data = jwt.decode(token, secret, algorithms=['HS256'])
+                    break
+                except jwt.InvalidTokenError:
+                    continue
+            
+            if not data:
+                return jsonify({'error': 'Invalid token'}), 403
+                
+            request.user_data = data
+            return f(*args, **kwargs)
+            
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expired'}), 403
+        except Exception as e:
+            return jsonify({'error': 'Token validation error'}), 403
+    
+    return decorated_function
+
+def require_admin(f):
+    """Decorator for routes requiring admin privileges"""
+    @wraps(f)
+    @require_auth
+    def decorated_function(*args, **kwargs):
+        if not request.user_data.get('isadmin', False):
+            return jsonify({'error': 'Access denied. Admin privileges required.'}), 403
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+# Optimized HTML template (moved to separate function for clarity)
+def get_html_template():
+    """Return the HTML template - could be moved to external file in production"""
+    return '''
 <!DOCTYPE html>
 <html lang="en">
 
@@ -283,7 +386,7 @@ HTML_TEMPLATE = '''
             <div class="logo">
                 <h1>Pwnterrey</h1>
                 <p style="color: #666; margin-top: 0.5rem;">Pwnterrey Demo Application</p>
-                <img src="static/img.png">
+                <img src="static/img.png" alt="Pwnterrey Logo">
             </div>
 
             <div id="alertContainer"></div>
@@ -359,245 +462,266 @@ HTML_TEMPLATE = '''
     </div>
 
     <script>
-        let authToken = null;
-
-        window.addEventListener('load', function () {
-            const savedToken = getCookie('Bearer');
-            if (savedToken) {
-                authToken = savedToken;
-                // Verify token is still valid by calling protected route
-                fetch('/protected', {
-                    headers: {
-                        'Authorization': `Bearer ${authToken}`
-                    }
-                }).then(response => {
-                    if (response.ok) {
-                        showLogin();
-                        showAlert('Welcome back! Logged in from saved session.', 'success');
-                    } else {
-                        deleteCookie('Bearer');
-                        authToken = null;
-                    }
-                }).catch(() => {
-                    deleteCookie('Bearer');
-                    authToken = null;
-                });
+        class PwnterreyApp {
+            constructor() {
+                this.authToken = null;
+                this.isEditing = false;
+                this.init();
             }
-        });
 
-        function showAlert(message, type = 'error') {
-            const alertContainer = document.getElementById('alertContainer');
-            const alertDiv = document.createElement('div');
-            alertDiv.className = `alert alert-${type}`;
-            alertDiv.textContent = message;
-            alertContainer.innerHTML = '';
-            alertContainer.appendChild(alertDiv);
+            init() {
+                this.bindEvents();
+                this.checkSavedSession();
+            }
 
-            setTimeout(() => {
-                alertDiv.remove();
-            }, 5000);
-        }
+            bindEvents() {
+                document.getElementById('loginForm').addEventListener('submit', (e) => this.handleLogin(e));
+            }
 
-        document.getElementById('loginForm').addEventListener('submit', async function (e) {
-            e.preventDefault();
-
-            const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
-
-            try {
-                const response = await fetch('/login', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ username, password })
-                });
-
-                const data = await response.json();
-
-                if (response.ok) {
-                    authToken = data.token;
-                    setCookie('Bearer', authToken, 5);
-                    showLogin();
-                    showAlert('Login successful!', 'success');
-                } else {
-                    showAlert(data.error || 'Login failed');
+            checkSavedSession() {
+                const savedToken = this.getCookie('Bearer');
+                if (savedToken) {
+                    this.authToken = savedToken;
+                    this.verifyToken().then(valid => {
+                        if (valid) {
+                            this.showProtectedArea();
+                            this.showAlert('Welcome back! Logged in from saved session.', 'success');
+                        } else {
+                            this.clearSession();
+                        }
+                    });
                 }
-            } catch (error) {
-                showAlert('Network error: ' + error.message);
             }
-        });
 
-        function setCookie(name, value, minutes) {
-            const date = new Date();
-            date.setTime(date.getTime() + (minutes * 60 * 1000));
-            const expires = "expires=" + date.toUTCString();
-            document.cookie = name + "=" + value + ";" + expires + ";path=/";
-        }
-
-        function getCookie(name) {
-            const nameEQ = name + "=";
-            const ca = document.cookie.split(';');
-            for (let i = 0; i < ca.length; i++) {
-                let c = ca[i];
-                while (c.charAt(0) == ' ') c = c.substring(1, c.length);
-                if (c.indexOf(nameEQ) == 0) return c.substring(nameEQ.length, c.length);
-            }
-            return null;
-        }
-
-        function deleteCookie(name) {
-            document.cookie = name + "=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
-        }
-
-        function checkAdminStatus() {
-            try {
-                const payload = JSON.parse(atob(authToken.split('.')[1]));
-                const isAdmin = payload.isadmin;
-                
-                if (!isAdmin) {
-                    document.querySelector('.edit-btn').style.display = 'none';
-                    document.getElementById('profileForm').style.display = 'none';
-                } else {
-                    document.querySelector('.edit-btn').style.display = 'block';
+            async verifyToken() {
+                try {
+                    const response = await fetch('/protected', {
+                        headers: { 'Authorization': `Bearer ${this.authToken}` }
+                    });
+                    return response.ok;
+                } catch {
+                    return false;
                 }
-            } catch (error) {
-                console.error('Error checking admin status:', error);
-            }
-        }
-
-        function showLogin() {
-            document.getElementById('loginArea').classList.add('hidden');
-            document.getElementById('protectedArea').classList.remove('hidden');
-            document.getElementById('tokenDisplay').textContent = authToken;
-            document.getElementById('lastLogin').textContent = new Date().toLocaleString();
-            checkAdminStatus();
-            loadProfile();
-        }
-
-        function logout() {
-            authToken = null;
-            deleteCookie('Bearer');
-            document.getElementById('loginArea').classList.remove('hidden');
-            document.getElementById('protectedArea').classList.add('hidden');
-            document.getElementById('loginArea').style.display = 'block';
-            document.getElementById('protectedArea').style.display = 'none';
-            document.getElementById('username').value = '';
-            document.getElementById('password').value = '';
-            document.getElementById('alertContainer').innerHTML = '';
-            showAlert('Logged out successfully', 'success');
-        }
-
-        async function accessProtectedRoute() {
-            if (!authToken) {
-                showAlert('Please login first');
-                return;
             }
 
-            try {
-                const response = await fetch('/protected', {
-                    headers: {
-                        'Authorization': `Bearer ${authToken}`
-                    }
-                });
+            showAlert(message, type = 'error') {
+                const alertContainer = document.getElementById('alertContainer');
+                const alertDiv = document.createElement('div');
+                alertDiv.className = `alert alert-${type}`;
+                alertDiv.textContent = message;
+                alertContainer.innerHTML = '';
+                alertContainer.appendChild(alertDiv);
 
-                const data = await response.json();
-
-                if (response.ok) {
-                    showAlert(data.message, 'success');
-                } else {
-                    showAlert(data.error || 'Access denied');
-                }
-            } catch (error) {
-                showAlert('Network error: ' + error.message);
+                setTimeout(() => alertDiv.remove(), 5000);
             }
-        }
 
-        let isEditing = false;
+            async handleLogin(e) {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+                const loginData = {
+                    username: formData.get('username'),
+                    password: formData.get('password')
+                };
 
-        async function loadProfile() {
-            if (!authToken) return;
-            try {
-                const response = await fetch('/profile', {
-                    headers: {
-                        'Authorization': `Bearer ${authToken}`
-                    }
-                });
-                
-                if (response.ok) {
-                    const profile = await response.json();
-                    // VULNERABLE: Direct innerHTML injection without sanitization
-                    document.getElementById('displayName').innerHTML = `${profile.first_name} ${profile.last_name}`;
-                    document.getElementById('displayEmail').innerHTML = profile.email;
-                    document.getElementById('displayPhone').innerHTML = profile.phone; // XSS vulnerability here
-                    
-                    // Populate form fields
-                    document.getElementById('firstName').value = profile.first_name;
-                    document.getElementById('lastName').value = profile.last_name;
-                    document.getElementById('email').value = profile.email;
-                    document.getElementById('phone').value = profile.phone;
-                }
-            } catch (error) {
-                console.error('Error loading profile:', error);
-            }
-        }
+                try {
+                    const response = await fetch('/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(loginData)
+                    });
 
-        function toggleEditProfile() {
-            const form = document.getElementById('profileForm');
-            const button = event.target;
-            
-            if (isEditing) return;
-            
-            form.classList.remove('hidden');
-            button.textContent = 'Editing...';
-            button.disabled = true;
-            isEditing = true;
-        }
-
-        async function saveProfile() {
-            const phoneValue = document.getElementById('phone').value;
-            const phoneRegex = /^[\+]?[1-9][\d]{0,15}$/;
-            if (phoneValue && !phoneRegex.test(phoneValue)) {
-                showAlert('Invalid phone number format. Please enter a valid phone number.');
-                return;
-            }
-            const profileData = {
-                first_name: document.getElementById('firstName').value,
-                last_name: document.getElementById('lastName').value,
-                email: document.getElementById('email').value,
-                phone: phoneValue
-            };
-            
-            try {
-                const response = await fetch('/profile', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${authToken}`
-                    },
-                    body: JSON.stringify(profileData)
-                });
-                
-                if (response.ok) {
-                    showAlert('Profile updated successfully!', 'success');
-                    loadProfile(); // Reload to show updated data
-                    cancelEdit();
-                } else {
                     const data = await response.json();
-                    showAlert(data.error || 'Failed to update profile');
+
+                    if (response.ok) {
+                        this.authToken = data.token;
+                        this.setCookie('Bearer', this.authToken, 30);
+                        this.showProtectedArea();
+                        this.showAlert('Login successful!', 'success');
+                    } else {
+                        this.showAlert(data.error || 'Login failed');
+                    }
+                } catch (error) {
+                    this.showAlert('Network error: ' + error.message);
                 }
-            } catch (error) {
-                showAlert('Network error: ' + error.message);
+            }
+
+            setCookie(name, value, minutes) {
+                const date = new Date();
+                date.setTime(date.getTime() + (minutes * 60 * 1000));
+                document.cookie = `${name}=${value};expires=${date.toUTCString()};path=/`;
+            }
+
+            getCookie(name) {
+                const nameEQ = name + "=";
+                return document.cookie.split(';')
+                    .map(c => c.trim())
+                    .find(c => c.indexOf(nameEQ) === 0)
+                    ?.substring(nameEQ.length) || null;
+            }
+
+            deleteCookie(name) {
+                document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 UTC;path=/`;
+            }
+
+            clearSession() {
+                this.authToken = null;
+                this.deleteCookie('Bearer');
+            }
+
+            checkAdminStatus() {
+                try {
+                    const payload = JSON.parse(atob(this.authToken.split('.')[1]));
+                    const isAdmin = payload.isadmin;
+                    
+                    const editBtn = document.querySelector('.edit-btn');
+                    const profileForm = document.getElementById('profileForm');
+                    
+                    if (!isAdmin) {
+                        editBtn.style.display = 'none';
+                        profileForm.style.display = 'none';
+                    } else {
+                        editBtn.style.display = 'block';
+                    }
+                } catch (error) {
+                    console.error('Error checking admin status:', error);
+                }
+            }
+
+            showProtectedArea() {
+                document.getElementById('loginArea').classList.add('hidden');
+                document.getElementById('protectedArea').classList.remove('hidden');
+                document.getElementById('tokenDisplay').textContent = this.authToken;
+                document.getElementById('lastLogin').textContent = new Date().toLocaleString();
+                this.checkAdminStatus();
+                this.loadProfile();
+            }
+
+            logout() {
+                this.clearSession();
+                document.getElementById('loginArea').classList.remove('hidden');
+                document.getElementById('protectedArea').classList.add('hidden');
+                document.getElementById('username').value = '';
+                document.getElementById('password').value = '';
+                document.getElementById('alertContainer').innerHTML = '';
+                this.showAlert('Logged out successfully', 'success');
+            }
+
+            async accessProtectedRoute() {
+                if (!this.authToken) {
+                    this.showAlert('Please login first');
+                    return;
+                }
+
+                try {
+                    const response = await fetch('/protected', {
+                        headers: { 'Authorization': `Bearer ${this.authToken}` }
+                    });
+
+                    const data = await response.json();
+                    this.showAlert(data.message || data.error, response.ok ? 'success' : 'error');
+                } catch (error) {
+                    this.showAlert('Network error: ' + error.message);
+                }
+            }
+
+            async loadProfile() {
+                if (!this.authToken) return;
+                
+                try {
+                    const response = await fetch('/profile', {
+                        headers: { 'Authorization': `Bearer ${this.authToken}` }
+                    });
+                    
+                    if (response.ok) {
+                        const profile = await response.json();
+                        // VULNERABLE: Direct innerHTML injection without sanitization - preserved
+                        document.getElementById('displayName').innerHTML = `${profile.first_name} ${profile.last_name}`;
+                        document.getElementById('displayEmail').innerHTML = profile.email;
+                        document.getElementById('displayPhone').innerHTML = profile.phone; // XSS vulnerability here - preserved
+                        
+                        // Populate form fields
+                        document.getElementById('firstName').value = profile.first_name;
+                        document.getElementById('lastName').value = profile.last_name;
+                        document.getElementById('email').value = profile.email;
+                        document.getElementById('phone').value = profile.phone;
+                    }
+                } catch (error) {
+                    console.error('Error loading profile:', error);
+                }
+            }
+
+            toggleEditProfile() {
+                if (this.isEditing) return;
+                
+                const form = document.getElementById('profileForm');
+                const button = event.target;
+                
+                form.classList.remove('hidden');
+                button.textContent = 'Editing...';
+                button.disabled = true;
+                this.isEditing = true;
+            }
+
+            async saveProfile() {
+                const phoneValue = document.getElementById('phone').value;
+                const phoneRegex = /^[\+]?[1-9][\d]{0,15}$/;
+                
+                if (phoneValue && !phoneRegex.test(phoneValue)) {
+                    this.showAlert('Invalid phone number format. Please enter a valid phone number.');
+                    return;
+                }
+
+                const profileData = {
+                    first_name: document.getElementById('firstName').value,
+                    last_name: document.getElementById('lastName').value,
+                    email: document.getElementById('email').value,
+                    phone: phoneValue
+                };
+                
+                try {
+                    const response = await fetch('/profile', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${this.authToken}`
+                        },
+                        body: JSON.stringify(profileData)
+                    });
+                    
+                    if (response.ok) {
+                        this.showAlert('Profile updated successfully!', 'success');
+                        this.loadProfile();
+                        this.cancelEdit();
+                    } else {
+                        const data = await response.json();
+                        this.showAlert(data.error || 'Failed to update profile');
+                    }
+                } catch (error) {
+                    this.showAlert('Network error: ' + error.message);
+                }
+            }
+
+            cancelEdit() {
+                document.getElementById('profileForm').classList.add('hidden');
+                const button = document.querySelector('.edit-btn');
+                button.textContent = 'Edit Profile';
+                button.disabled = false;
+                this.isEditing = false;
             }
         }
 
-        function cancelEdit() {
-            document.getElementById('profileForm').classList.add('hidden');
-            const button = document.querySelector('.edit-btn');
-            button.textContent = 'Edit Profile';
-            button.disabled = false;
-            isEditing = false;
-        }
+        // Global functions for backwards compatibility
+        let app;
+        
+        window.addEventListener('load', () => {
+            app = new PwnterreyApp();
+        });
+
+        function logout() { app.logout(); }
+        function accessProtectedRoute() { app.accessProtectedRoute(); }
+        function toggleEditProfile() { app.toggleEditProfile(); }
+        function saveProfile() { app.saveProfile(); }
+        function cancelEdit() { app.cancelEdit(); }
     </script>
 </body>
 
@@ -606,124 +730,220 @@ HTML_TEMPLATE = '''
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(get_html_template())
 
-@app.route('/profile', methods={'GET'})
-@cross_origin()
+@app.route('/profile', methods=['GET'])
+@require_auth
 def get_profile():
-    auth_header = request.headers.get('Authorization')
-    if not auth_header:
-        return jsonify({'error': 'Missing token'}), 403
-
+    username = request.user_data['user']
+    
     try:
-        token = auth_header.split()[1]
-        data = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
-        username = data['user']
-        
-        conn = sqlite3.connect('pwnterrey.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM profiles WHERE username = ?', (username,))
-        profile = cursor.fetchone()
-        conn.close()
-        
-        if profile:
-            return jsonify({
-                'first_name': profile[2] or '',
-                'last_name': profile[3] or '',
-                'email': profile[4] or '',
-                'phone': profile[5] or '',
-                'picture': profile[6] or ''
-            })
-        else:
-            return jsonify({
-                'first_name': '',
-                'last_name': '',
-                'email': '',
-                'phone': '',
-                'picture': ''
-            })
-    except jwt.ExpiredSignatureError:
-        return jsonify({'error': 'Token expired'}), 403
-    except jwt.InvalidTokenError:
-        return jsonify({'error': 'Invalid token'}), 403
-
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM profiles WHERE username = ?', (username,))
+            profile = cursor.fetchone()
+            
+            if profile:
+                return jsonify({
+                    'first_name': profile['first_name'] or '',
+                    'last_name': profile['last_name'] or '',
+                    'email': profile['email'] or '',
+                    'phone': profile['phone'] or '',
+                    'picture': profile['picture'] or ''
+                })
+            else:
+                # Return empty profile if none exists
+                return jsonify({
+                    'first_name': '',
+                    'last_name': '',
+                    'email': '',
+                    'phone': '',
+                    'picture': ''
+                })
+    except Exception as e:
+        return jsonify({'error': 'Database error'}), 500
 
 @app.route('/profile', methods=['POST'])
-@cross_origin()
+@require_admin
 def update_profile():
-    auth_header = request.headers.get('Authorization')
-    if not auth_header:
-        return jsonify({'error': 'Missing token'}), 403
-
+    username = request.user_data['user']
+    
     try:
-        token = auth_header.split()[1]
-        data = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
-        username = data['user']
-        is_admin = data.get('isadmin', False)
-        if not is_admin:
-            return jsonify({'error': 'Access denied. Admin privileges required.'}), 403
         profile_data = request.get_json()
-        first_name = profile_data.get('first_name', '')
-        last_name = profile_data.get('last_name', '')
-        email = profile_data.get('email', '')
-        phone = profile_data.get('phone', '')  
-        picture = profile_data.get('picture', '')
+        if not profile_data:
+            return jsonify({'error': 'No data provided'}), 400
         
-        conn = sqlite3.connect('pwnterrey.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO profiles 
-            (username, first_name, last_name, email, phone, picture)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (username, first_name, last_name, email, phone, picture))
-        conn.commit()
-        conn.close()
+        # Extract and validate profile data
+        first_name = profile_data.get('first_name', '').strip()
+        last_name = profile_data.get('last_name', '').strip()
+        email = profile_data.get('email', '').strip()
+        phone = profile_data.get('phone', '').strip()
+        picture = profile_data.get('picture', '').strip()
+        
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO profiles 
+                (username, first_name, last_name, email, phone, picture)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (username, first_name, last_name, email, phone, picture))
         
         return jsonify({'message': 'Profile updated successfully'})
-    except jwt.ExpiredSignatureError:
-        return jsonify({'error': 'Token expired'}), 403
-    except jwt.InvalidTokenError:
-        return jsonify({'error': 'Invalid token'}), 403
-
+        
+    except Exception as e:
+        return jsonify({'error': f'Failed to update profile. {str(e)}'}), 500
 
 @app.route('/login', methods=['POST'])
-@cross_origin()
 def login():
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'No data provided'}), 400
-        
-    username = data.get('username')
-    password = data.get('password')
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
+        username = data.get('username', '').strip()
+        password = data.get('password', '')
 
-    if username in users and users[username]["password"] == password:
-        token = jwt.encode({
-            'user': username,
-            'isadmin': users[username]["is_admin"],
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=5)
-        }, SECRET_KEY, algorithm='HS256')
-        return jsonify({'token': token})
-    return jsonify({'error': 'Invalid credentials'}), 401
+        if not username or not password:
+            return jsonify({'error': 'Username and password required'}), 400
+
+        if user_manager.authenticate(username, password):
+            user_info = user_manager.get_user_info(username)
+            token = jwt.encode({
+                'user': username,
+                'isadmin': user_info["is_admin"],
+                'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
+            }, SECRET_KEY, algorithm='HS256')
+            return jsonify({'token': token})
+            
+        return jsonify({'error': 'Invalid credentials'}), 401
+        
+    except Exception as e:
+        return jsonify({'error': 'Login processing error'}), 500
 
 @app.route('/static/<path:filename>')
 def serve_static(filename):
+    """Serve static files - add basic security checks"""
+    if '..' in filename or filename.startswith('/'):
+        return jsonify({'error': 'Invalid file path'}), 400
     return app.send_static_file(filename)
 
 @app.route('/protected', methods=['GET'])
-@cross_origin()
+@require_auth
 def protected():
-    auth_header = request.headers.get('Authorization')
-    if not auth_header:
-        return jsonify({'error': 'Missing token'}), 403
+    username = request.user_data['user']
+    return jsonify({'message': f"Welcome back, {username}! You have access to sensitive Pwnterrey data."})
 
+@app.route('/latest/meta-data', methods=['GET'])
+def admin_files():
+    """SSRF vulnerability preserved - intentional security flaw"""
+    referrer = request.headers.get('Referer', '')
+    user_agent = request.headers.get('User-Agent', '')
+    
+    # if 'javascript:' in referrer.lower() or not referrer:
+        # return jsonify({'error': 'Access denied: Suspicious request origin detected'}), 403
+    
     try:
-        token = auth_header.split()[1]
-        data = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
-        return jsonify({'message': f"Welcome back, {data['user']}! You have access to sensitive Pwnterrey data."})
-    except jwt.ExpiredSignatureError:
-        return jsonify({'error': 'Token expired'}), 403
-    except jwt.InvalidTokenError:
-        return jsonify({'error': 'Invalid token'}), 403
+        # Simulate sensitive file listing - vulnerability preserved
+        sensitive_files = [
+            {'name': 'config.txt', 'content': 'DATABASE_URL=postgresql://admin:secret123@localhost/pwnterrey'},
+            {'name': 'users.txt', 'content': 'admin:admin:true\nuser:user:false\nsecretuser:password123:true'},
+            {'name': 'api_keys.txt', 'content': 'AWS_KEY=AKIA1234567890EXAMPLE\nSTRIPE_KEY=sk_test_1234567890abcdef'}
+        ]
+        
+        return jsonify({'files': sensitive_files})
+        
+    except Exception as e:
+        return jsonify({'error': 'File access error'}), 500
+
+class XMLLoginHandler(ContentHandler):
+    """Optimized XML handler class"""
+    def __init__(self):
+        self.username = None
+        self.password = None
+        self.current_element = None
+        self.content = ""
+        self.depth = 0
+        self.max_depth = 4  # Prevent deep nesting attacks
+    
+    def startElement(self, name, attrs):
+        self.depth += 1
+        if self.depth > self.max_depth:
+            raise ValueError("XML nesting too deep")
+            
+        self.current_element = name
+        self.content = ""
+    
+    def characters(self, content):
+        if len(self.content) < 1000:  # Prevent memory exhaustion
+            self.content += content
+    
+    def endElement(self, name):
+        self.depth -= 1
+        if name == 'username':
+            self.username = self.content.strip()[:500]  # Limit length
+        elif name == 'password':
+            self.password = self.content.strip()[:500]  # Limit length
+
+@app.route('/xml', methods=['POST'])
+def xml_login():
+    """XXE vulnerability preserved - intentional security flaw"""
+    try:
+        xml_data = request.data.decode('utf-8')
+        if not xml_data or len(xml_data) > 10000:  # Basic size limit
+            return jsonify({'error': 'Invalid XML data'}), 400
+
+        parser = make_parser()
+        parser.setFeature(feature_external_ges, True) # XXE Vulnerability
+        handler = XMLLoginHandler()
+        parser.setContentHandler(handler)
+
+        parser.parse(io.StringIO(xml_data))
+
+        if not handler.username or not handler.password:
+            return jsonify({'error': 'Missing username or password in XML'}), 400
+
+        if user_manager.authenticate(handler.username, handler.password):
+            user_info = user_manager.get_user_info(handler.username)
+            token = jwt.encode({
+                'user': handler.username,
+                'isadmin': user_info["is_admin"],
+                'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
+            }, XML_SECRET, algorithm='HS256')
+            return jsonify({'token': token})
+        else:
+            return jsonify({'error': f'Invalid credentials: {str(handler.username)}, {str(handler.password)}'}), 401
+            
+    except ET.ParseError:
+        return jsonify({'error': 'Invalid XML format'}), 400
+    except ValueError as e:
+        return jsonify({'error': f'XML processing error: {str(e)}'}), 400
+    except Exception as e:
+        return jsonify({'error': f'XML processing error: {str(e)}'}), 500
+
+@app.errorhandler(404)
+def not_found_error(error):
+    return jsonify({'error': 'Resource not found'}), 404
+
+@app.errorhandler(405)
+def method_not_allowed_error(error):
+    return jsonify({'error': 'Method not allowed'}), 405
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Handle unexpected exceptions"""
+    app.logger.error(f'Unhandled exception: {str(e)}')
+    return jsonify({'error': 'An unexpected error occurred'}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=8000)
+    # Production-like configuration
+    app.run(
+        debug=True,
+        host='0.0.0.0',
+        port=8000,
+        threaded=True,
+        use_reloader=True
+    )
